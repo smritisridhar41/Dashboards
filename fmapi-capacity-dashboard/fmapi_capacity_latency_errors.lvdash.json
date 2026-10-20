@@ -1,0 +1,5335 @@
+{
+  "datasets": [
+    {
+      "name": "lookback_options",
+      "displayName": "Lookback Options",
+      "queryLines": [
+        "SELECT * FROM VALUES ('1'), ('7'), ('14'), ('30'), ('90') AS t(days)\n"
+      ]
+    },
+    {
+      "name": "kpi",
+      "displayName": "Capacity KPIs by Workspace / Model",
+      "queryLines": [
+        "WITH req AS (\n",
+        "  SELECT\n",
+        "    workspace_id,\n",
+        "    model_key,\n",
+        "    ANY_VALUE(model_provider)                                        AS model_provider,\n",
+        "    CONCAT_WS(', ', COLLECT_SET(endpoint_name))                      AS endpoints,\n",
+        "    COUNT(*)                                                         AS requests,\n",
+        "    COUNT_IF(status_code BETWEEN 200 AND 299)                        AS success_requests,\n",
+        "    COUNT_IF(status_code = 429)                                      AS errors_429,\n",
+        "    COUNT_IF(status_code BETWEEN 400 AND 499 AND status_code <> 429) AS errors_4xx,\n",
+        "    COUNT_IF(status_code >= 500)                                     AS errors_5xx,\n",
+        "    SUM(input_tokens)                                                AS input_tokens,\n",
+        "    SUM(cache_read_tokens)                                           AS cache_read_tokens,\n",
+        "    SUM(output_tokens)                                               AS output_tokens,\n",
+        "    PERCENTILE_APPROX(latency_ms, 0.50) / 1000.0                     AS latency_p50_s,\n",
+        "    PERCENTILE_APPROX(latency_ms, 0.95) / 1000.0                     AS latency_p95_s,\n",
+        "    PERCENTILE_APPROX(latency_ms, 0.99) / 1000.0                     AS latency_p99_s,\n",
+        "    PERCENTILE_APPROX(ttfb_ms, 0.95) / 1000.0                        AS ttfb_p95_s,\n",
+        "    PERCENTILE_APPROX(ttfb_ms, 0.99) / 1000.0                        AS ttfb_p99_s\n",
+        "  FROM main.fmapi_observability.requests\n",
+        "  WHERE event_time >= CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT))\n",
+        "  GROUP BY ALL\n",
+        "),\n",
+        "mins AS (\n",
+        "  SELECT\n",
+        "    workspace_id,\n",
+        "    model_key,\n",
+        "    MAX(itpm)                       AS peak_itpm,\n",
+        "    PERCENTILE_APPROX(itpm, 0.99)   AS p99_itpm,\n",
+        "    PERCENTILE_APPROX(itpm, 0.95)   AS p95_itpm,\n",
+        "    MAX(otpm)                       AS peak_otpm,\n",
+        "    PERCENTILE_APPROX(otpm, 0.99)   AS p99_otpm,\n",
+        "    MAX(requests)                   AS peak_rpm\n",
+        "  FROM main.fmapi_observability.minute_metrics\n",
+        "  WHERE event_minute >= CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT))\n",
+        "  GROUP BY ALL\n",
+        "),\n",
+        "lim AS (\n",
+        "  SELECT workspace_id, model_key, itpm_limit, otpm_limit\n",
+        "  FROM main.fmapi_observability.capacity_limits\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, model_key ORDER BY effective_from DESC) = 1\n",
+        "),\n",
+        "wsn AS (\n",
+        "  SELECT w.workspace_id, COALESCE(c.workspace_name, w.workspace_name) AS workspace_name\n",
+        "  FROM main.fmapi_observability.workspaces w\n",
+        "  LEFT JOIN (SELECT workspace_id, MAX(workspace_name) AS workspace_name FROM main.fmapi_observability.capacity_limits GROUP BY 1) c\n",
+        "    USING (workspace_id)\n",
+        "),\n",
+        "x AS (\n",
+        "  SELECT\n",
+        "    r.*,\n",
+        "    m.peak_itpm, m.p99_itpm, m.p95_itpm, m.peak_otpm, m.p99_otpm, m.peak_rpm,\n",
+        "    l.itpm_limit, l.otpm_limit,\n",
+        "    m.peak_itpm / NULLIF(l.itpm_limit, 0)       AS peak_itpm_util,\n",
+        "    m.p99_itpm  / NULLIF(l.itpm_limit, 0)       AS p99_itpm_util,\n",
+        "    m.peak_otpm / NULLIF(l.otpm_limit, 0)       AS peak_otpm_util,\n",
+        "    r.success_requests / NULLIF(r.requests, 0)  AS success_rate,\n",
+        "    r.errors_429 / NULLIF(r.requests, 0)        AS rate_429,\n",
+        "    r.errors_5xx / NULLIF(r.requests, 0)        AS rate_5xx,\n",
+        "    r.cache_read_tokens / NULLIF(r.input_tokens, 0) AS cache_hit_rate\n",
+        "  FROM req r\n",
+        "  LEFT JOIN mins m USING (workspace_id, model_key)\n",
+        "  LEFT JOIN lim l  USING (workspace_id, model_key)\n",
+        ")\n",
+        "SELECT\n",
+        "  COALESCE(wsn.workspace_name, x.workspace_id)                                  AS workspace,\n",
+        "  x.workspace_id,\n",
+        "  x.model_key                                 AS model,\n",
+        "  x.model_provider                            AS provider,\n",
+        "  CONCAT(COALESCE(wsn.workspace_name, x.workspace_id), ' / ', x.model_key)      AS ws_model,\n",
+        "  x.* EXCEPT (workspace_id, model_key, model_provider),\n",
+        "  CASE\n",
+        "    WHEN x.itpm_limit IS NULL THEN '4 - No limit on file'\n",
+        "    WHEN GREATEST(x.peak_itpm_util, COALESCE(x.peak_otpm_util, 0)) >= 0.9 OR x.rate_429 >= 0.01\n",
+        "      THEN '1 - Request more capacity'\n",
+        "    WHEN GREATEST(x.peak_itpm_util, COALESCE(x.peak_otpm_util, 0)) >= 0.7 OR x.errors_429 > 0\n",
+        "      THEN '2 - Watch'\n",
+        "    ELSE '3 - Healthy'\n",
+        "  END                                         AS capacity_status,\n",
+        "  CEIL(x.peak_itpm * 1.3 / 1e6) * 1e6         AS recommended_itpm,\n",
+        "  GREATEST(CEIL(x.peak_itpm * 1.3 / 1e6) * 1e6 - x.itpm_limit, 0) AS additional_itpm_needed,\n",
+        "  CEIL(x.peak_otpm * 1.3 / 1e5) * 1e5         AS recommended_otpm,\n",
+        "  GREATEST(CEIL(x.peak_otpm * 1.3 / 1e5) * 1e5 - x.otpm_limit, 0) AS additional_otpm_needed\n",
+        "FROM x\n",
+        "LEFT JOIN wsn USING (workspace_id)\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Days Lookback",
+          "keyword": "lookback",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "7"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "hourly",
+      "displayName": "Hourly Metrics",
+      "queryLines": [
+        "WITH lim AS (\n",
+        "  SELECT workspace_id, model_key, itpm_limit, otpm_limit\n",
+        "  FROM main.fmapi_observability.capacity_limits\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, model_key ORDER BY effective_from DESC) = 1\n",
+        "),\n",
+        "wsn AS (\n",
+        "  SELECT w.workspace_id, COALESCE(c.workspace_name, w.workspace_name) AS workspace_name\n",
+        "  FROM main.fmapi_observability.workspaces w\n",
+        "  LEFT JOIN (SELECT workspace_id, MAX(workspace_name) AS workspace_name FROM main.fmapi_observability.capacity_limits GROUP BY 1) c\n",
+        "    USING (workspace_id)\n",
+        ")\n",
+        "SELECT\n",
+        "  COALESCE(wsn.workspace_name, x.workspace_id)                                  AS workspace,\n",
+        "  x.model_key                                 AS model,\n",
+        "  x.model_provider                            AS provider,\n",
+        "  CONCAT(COALESCE(wsn.workspace_name, x.workspace_id), ' / ', x.model_key)      AS ws_model,\n",
+        "  x.* EXCEPT (model_key, model_provider),\n",
+        "  l.itpm_limit,\n",
+        "  l.otpm_limit,\n",
+        "  x.peak_itpm / NULLIF(l.itpm_limit, 0)       AS itpm_util,\n",
+        "  x.peak_otpm / NULLIF(l.otpm_limit, 0)       AS otpm_util,\n",
+        "  (x.requests - x.success_requests) / NULLIF(x.requests, 0) AS error_rate,\n",
+        "  x.latency_p50_ms / 1000.0                   AS latency_p50_s,\n",
+        "  x.latency_p95_ms / 1000.0                   AS latency_p95_s,\n",
+        "  x.latency_p99_ms / 1000.0                   AS latency_p99_s,\n",
+        "  x.ttfb_p95_ms / 1000.0                      AS ttfb_p95_s,\n",
+        "  x.ttfb_p99_ms / 1000.0                      AS ttfb_p99_s\n",
+        "FROM main.fmapi_observability.hourly_metrics x\n",
+        "LEFT JOIN lim l USING (workspace_id, model_key)\n",
+        "LEFT JOIN wsn USING (workspace_id)\n",
+        "WHERE x.event_hour >= DATE_TRUNC('HOUR', CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT)))\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Days Lookback",
+          "keyword": "lookback",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "7"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "errors",
+      "displayName": "Requests by Status Code (Hourly)",
+      "queryLines": [
+        "WITH lim AS (\n",
+        "  SELECT workspace_id, model_key, itpm_limit, otpm_limit\n",
+        "  FROM main.fmapi_observability.capacity_limits\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, model_key ORDER BY effective_from DESC) = 1\n",
+        "),\n",
+        "wsn AS (\n",
+        "  SELECT w.workspace_id, COALESCE(c.workspace_name, w.workspace_name) AS workspace_name\n",
+        "  FROM main.fmapi_observability.workspaces w\n",
+        "  LEFT JOIN (SELECT workspace_id, MAX(workspace_name) AS workspace_name FROM main.fmapi_observability.capacity_limits GROUP BY 1) c\n",
+        "    USING (workspace_id)\n",
+        ")\n",
+        "SELECT\n",
+        "  COALESCE(wsn.workspace_name, x.workspace_id)                                  AS workspace,\n",
+        "  x.model_key                                 AS model,\n",
+        "  CONCAT(COALESCE(wsn.workspace_name, x.workspace_id), ' / ', x.model_key)      AS ws_model,\n",
+        "  x.event_hour,\n",
+        "  x.status_code,\n",
+        "  x.status_class,\n",
+        "  COUNT(*)                                    AS requests\n",
+        "FROM main.fmapi_observability.requests x\n",
+        "LEFT JOIN wsn USING (workspace_id)\n",
+        "WHERE x.event_time >= CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT))\n",
+        "GROUP BY ALL\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Days Lookback",
+          "keyword": "lookback",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "7"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "callers",
+      "displayName": "Usage by Caller",
+      "queryLines": [
+        "WITH lim AS (\n",
+        "  SELECT workspace_id, model_key, itpm_limit, otpm_limit\n",
+        "  FROM main.fmapi_observability.capacity_limits\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, model_key ORDER BY effective_from DESC) = 1\n",
+        "),\n",
+        "wsn AS (\n",
+        "  SELECT w.workspace_id, COALESCE(c.workspace_name, w.workspace_name) AS workspace_name\n",
+        "  FROM main.fmapi_observability.workspaces w\n",
+        "  LEFT JOIN (SELECT workspace_id, MAX(workspace_name) AS workspace_name FROM main.fmapi_observability.capacity_limits GROUP BY 1) c\n",
+        "    USING (workspace_id)\n",
+        ")\n",
+        "SELECT\n",
+        "  COALESCE(wsn.workspace_name, x.workspace_id)                                  AS workspace,\n",
+        "  x.model_key                                 AS model,\n",
+        "  x.requester,\n",
+        "  x.requester_type,\n",
+        "  COUNT(*)                                    AS requests,\n",
+        "  COUNT_IF(x.status_code = 429)               AS errors_429,\n",
+        "  COUNT_IF(x.status_code >= 500)              AS errors_5xx,\n",
+        "  COUNT_IF(x.status_code = 429) / COUNT(*)    AS rate_429,\n",
+        "  SUM(x.input_tokens + x.output_tokens)       AS total_tokens,\n",
+        "  PERCENTILE_APPROX(x.latency_ms, 0.95) / 1000.0 AS latency_p95_s\n",
+        "FROM main.fmapi_observability.requests x\n",
+        "LEFT JOIN wsn USING (workspace_id)\n",
+        "WHERE x.event_time >= CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT))\n",
+        "GROUP BY ALL\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Days Lookback",
+          "keyword": "lookback",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "7"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "spend",
+      "displayName": "Daily Spend by Model",
+      "queryLines": [
+        "WITH lim AS (\n",
+        "  SELECT workspace_id, model_key, itpm_limit, otpm_limit\n",
+        "  FROM main.fmapi_observability.capacity_limits\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, model_key ORDER BY effective_from DESC) = 1\n",
+        "),\n",
+        "wsn AS (\n",
+        "  SELECT w.workspace_id, COALESCE(c.workspace_name, w.workspace_name) AS workspace_name\n",
+        "  FROM main.fmapi_observability.workspaces w\n",
+        "  LEFT JOIN (SELECT workspace_id, MAX(workspace_name) AS workspace_name FROM main.fmapi_observability.capacity_limits GROUP BY 1) c\n",
+        "    USING (workspace_id)\n",
+        ")\n",
+        "SELECT\n",
+        "  COALESCE(wsn.workspace_name, x.workspace_id)                                  AS workspace,\n",
+        "  x.model_key                                 AS model,\n",
+        "  x.usage_date,\n",
+        "  x.endpoint_name,\n",
+        "  x.dbus,\n",
+        "  x.list_cost_usd\n",
+        "FROM main.fmapi_observability.daily_model_spend x\n",
+        "LEFT JOIN wsn USING (workspace_id)\n",
+        "WHERE x.usage_date >= CAST(CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT)) AS DATE)\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Days Lookback",
+          "keyword": "lookback",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "7"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "totals",
+      "displayName": "Totals",
+      "queryLines": [
+        "SELECT\n",
+        "  COUNT(*)                                                AS requests,\n",
+        "  COUNT_IF(status_code BETWEEN 200 AND 299) / COUNT(*)    AS success_rate,\n",
+        "  COUNT_IF(status_code = 429)                             AS errors_429,\n",
+        "  COUNT_IF(status_code >= 500)                            AS errors_5xx,\n",
+        "  PERCENTILE_APPROX(latency_ms, 0.95) / 1000.0            AS latency_p95_s,\n",
+        "  PERCENTILE_APPROX(latency_ms, 0.99) / 1000.0            AS latency_p99_s,\n",
+        "  SUM(input_tokens + output_tokens)                       AS total_tokens,\n",
+        "  CONCAT(CAST(MIN(event_date) AS STRING), '  \u2192  ', CAST(MAX(event_date) AS STRING)) AS date_range\n",
+        "FROM main.fmapi_observability.requests\n",
+        "WHERE event_time >= CURRENT_TIMESTAMP() - MAKE_DT_INTERVAL(CAST(:lookback AS INT))\n"
+      ],
+      "parameters": [
+        {
+          "displayName": "Days Lookback",
+          "keyword": "lookback",
+          "dataType": "STRING",
+          "defaultSelection": {
+            "values": {
+              "dataType": "STRING",
+              "values": [
+                {
+                  "value": "7"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "capacity_kpis",
+      "displayName": "Capacity KPIs",
+      "layout": [
+        {
+          "widget": {
+            "name": "kpi_title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Model Capacity, Latency & Errors\n",
+                "\n",
+                "Per workspace and model over the selected lookback. Utilization compares the busiest minute to the limits in `capacity_limits`."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 8,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_range",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "date_range",
+                      "expression": "`date_range`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Data Date Range"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "date_range"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 0,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_requests",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "requests",
+                      "expression": "`requests`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Requests"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "requests",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_success",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "success_rate",
+                      "expression": "`success_rate`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Success Rate"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "success_rate",
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_429",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "errors_429",
+                      "expression": "`errors_429`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "429 Errors"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "errors_429",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_5xx",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "errors_5xx",
+                      "expression": "`errors_5xx`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "5xx Errors"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "errors_5xx",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_p95",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "latency_p95_s",
+                      "expression": "`latency_p95_s`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Latency p95 (s)"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "latency_p95_s",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "c_p99",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "latency_p99_s",
+                      "expression": "`latency_p99_s`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Latency p99 (s)"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "latency_p99_s",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 10,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "global_lookback",
+            "queries": [
+              {
+                "name": "f_lookback_options",
+                "query": {
+                  "datasetName": "lookback_options",
+                  "fields": [
+                    {
+                      "name": "days",
+                      "expression": "`days`"
+                    },
+                    {
+                      "name": "days_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_totals",
+                "query": {
+                  "datasetName": "totals",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Days Lookback"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "days",
+                    "displayName": "days",
+                    "queryName": "f_lookback_options"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_kpi"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_hourly"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_errors"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_callers"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_spend"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_totals"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_ws",
+            "queries": [
+              {
+                "name": "f_kpi_ws_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_ws_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_ws_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_ws_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_ws_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_kpi_ws_kpi"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_kpi_ws_hourly"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_kpi_ws_errors"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_kpi_ws_callers"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_kpi_ws_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 4,
+            "width": 3,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_model",
+            "queries": [
+              {
+                "name": "f_kpi_model_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_model_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_model_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_model_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_model_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Model"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_kpi_model_kpi"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_kpi_model_hourly"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_kpi_model_errors"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_kpi_model_callers"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_kpi_model_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 5,
+            "y": 4,
+            "width": 4,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_provider",
+            "queries": [
+              {
+                "name": "f_kpi_provider_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "provider",
+                      "expression": "`provider`"
+                    },
+                    {
+                      "name": "provider_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_kpi_provider_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "provider",
+                      "expression": "`provider`"
+                    },
+                    {
+                      "name": "provider_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Provider"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "provider",
+                    "queryName": "f_kpi_provider_kpi"
+                  },
+                  {
+                    "fieldName": "provider",
+                    "queryName": "f_kpi_provider_hourly"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 4,
+            "width": 3,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "provider",
+                      "expression": "`provider`"
+                    },
+                    {
+                      "name": "capacity_status",
+                      "expression": "`capacity_status`"
+                    },
+                    {
+                      "name": "itpm_limit",
+                      "expression": "`itpm_limit`"
+                    },
+                    {
+                      "name": "peak_itpm",
+                      "expression": "`peak_itpm`"
+                    },
+                    {
+                      "name": "p99_itpm",
+                      "expression": "`p99_itpm`"
+                    },
+                    {
+                      "name": "peak_itpm_util",
+                      "expression": "`peak_itpm_util`"
+                    },
+                    {
+                      "name": "p99_itpm_util",
+                      "expression": "`p99_itpm_util`"
+                    },
+                    {
+                      "name": "otpm_limit",
+                      "expression": "`otpm_limit`"
+                    },
+                    {
+                      "name": "peak_otpm",
+                      "expression": "`peak_otpm`"
+                    },
+                    {
+                      "name": "peak_otpm_util",
+                      "expression": "`peak_otpm_util`"
+                    },
+                    {
+                      "name": "peak_rpm",
+                      "expression": "`peak_rpm`"
+                    },
+                    {
+                      "name": "requests",
+                      "expression": "`requests`"
+                    },
+                    {
+                      "name": "success_rate",
+                      "expression": "`success_rate`"
+                    },
+                    {
+                      "name": "errors_429",
+                      "expression": "`errors_429`"
+                    },
+                    {
+                      "name": "rate_429",
+                      "expression": "`rate_429`"
+                    },
+                    {
+                      "name": "errors_5xx",
+                      "expression": "`errors_5xx`"
+                    },
+                    {
+                      "name": "rate_5xx",
+                      "expression": "`rate_5xx`"
+                    },
+                    {
+                      "name": "latency_p50_s",
+                      "expression": "`latency_p50_s`"
+                    },
+                    {
+                      "name": "latency_p95_s",
+                      "expression": "`latency_p95_s`"
+                    },
+                    {
+                      "name": "latency_p99_s",
+                      "expression": "`latency_p99_s`"
+                    },
+                    {
+                      "name": "ttfb_p95_s",
+                      "expression": "`ttfb_p95_s`"
+                    },
+                    {
+                      "name": "ttfb_p99_s",
+                      "expression": "`ttfb_p99_s`"
+                    },
+                    {
+                      "name": "cache_hit_rate",
+                      "expression": "`cache_hit_rate`"
+                    },
+                    {
+                      "name": "recommended_itpm",
+                      "expression": "`recommended_itpm`"
+                    },
+                    {
+                      "name": "additional_itpm_needed",
+                      "expression": "`additional_itpm_needed`"
+                    },
+                    {
+                      "name": "endpoints",
+                      "expression": "`endpoints`"
+                    }
+                  ],
+                  "disaggregated": true,
+                  "orders": [
+                    {
+                      "direction": "ASC",
+                      "expression": "`capacity_status`"
+                    },
+                    {
+                      "direction": "DESC",
+                      "expression": "`peak_itpm_util`"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "frame": {
+                "showTitle": true,
+                "title": "Capacity KPIs by Workspace / Model",
+                "showDescription": true,
+                "description": "Util %: red >=100% \u00b7 orange >=90% \u00b7 yellow >=70% \u00b7 green <70%. Status: 'Request more capacity' = peak util >=90% or 429 rate >=1%; 'Watch' = peak util >=70% or any 429s. Recommended = peak x 1.3 (30% headroom), rounded up."
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace",
+                    "displayName": "Workspace",
+                    "columnWidth": 130,
+                    "useForSearch": true
+                  },
+                  {
+                    "fieldName": "model",
+                    "displayName": "Model",
+                    "columnWidth": 170,
+                    "useForSearch": true
+                  },
+                  {
+                    "fieldName": "provider",
+                    "displayName": "Provider",
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "capacity_status",
+                    "displayName": "Capacity Status",
+                    "columnWidth": 170,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "1 - Request more capacity"
+                            },
+                            "operator": "="
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "2 - Watch"
+                            },
+                            "operator": "="
+                          },
+                          "backgroundColor": "#FDE68A"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "3 - Healthy"
+                            },
+                            "operator": "="
+                          },
+                          "backgroundColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "itpm_limit",
+                    "displayName": "ITPM Limit",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "peak_itpm",
+                    "displayName": "Peak ITPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "p99_itpm",
+                    "displayName": "P99 ITPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "peak_itpm_util",
+                    "displayName": "Peak ITPM Util %",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 85,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "1"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.9"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FDE68A"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "p99_itpm_util",
+                    "displayName": "P99 ITPM Util %",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 85,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "1"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.9"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FDE68A"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "otpm_limit",
+                    "displayName": "OTPM Limit",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "peak_otpm",
+                    "displayName": "Peak OTPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "peak_otpm_util",
+                    "displayName": "Peak OTPM Util %",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 85,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "1"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.9"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FDE68A"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "peak_rpm",
+                    "displayName": "Peak RPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 75
+                  },
+                  {
+                    "fieldName": "requests",
+                    "displayName": "Requests",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "success_rate",
+                    "displayName": "Success %",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "errors_429",
+                    "displayName": "429s",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 65
+                  },
+                  {
+                    "fieldName": "rate_429",
+                    "displayName": "429 Rate",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 70,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.05"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.01"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FDE68A"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "errors_5xx",
+                    "displayName": "5xx",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 60
+                  },
+                  {
+                    "fieldName": "rate_5xx",
+                    "displayName": "5xx Rate",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 70,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.05"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.01"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FDE68A"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "latency_p50_s",
+                    "displayName": "Latency p50 (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "latency_p95_s",
+                    "displayName": "Latency p95 (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "latency_p99_s",
+                    "displayName": "Latency p99 (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 80
+                  },
+                  {
+                    "fieldName": "ttfb_p95_s",
+                    "displayName": "TTFT p95 (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 75
+                  },
+                  {
+                    "fieldName": "ttfb_p99_s",
+                    "displayName": "TTFT p99 (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 75
+                  },
+                  {
+                    "fieldName": "cache_hit_rate",
+                    "displayName": "Cache Hit %",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 75
+                  },
+                  {
+                    "fieldName": "recommended_itpm",
+                    "displayName": "Recommended ITPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 95
+                  },
+                  {
+                    "fieldName": "additional_itpm_needed",
+                    "displayName": "Additional ITPM Needed",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 100
+                  },
+                  {
+                    "fieldName": "endpoints",
+                    "displayName": "Endpoints",
+                    "columnWidth": 220
+                  }
+                ]
+              },
+              "displayRowNumbers": false,
+              "bandedRows": {
+                "enabled": true
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 12,
+            "height": 12
+          }
+        },
+        {
+          "widget": {
+            "name": "needs_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "capacity_status",
+                      "expression": "`capacity_status`"
+                    },
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "itpm_limit",
+                      "expression": "`itpm_limit`"
+                    },
+                    {
+                      "name": "peak_itpm",
+                      "expression": "`peak_itpm`"
+                    },
+                    {
+                      "name": "peak_itpm_util",
+                      "expression": "`peak_itpm_util`"
+                    },
+                    {
+                      "name": "recommended_itpm",
+                      "expression": "`recommended_itpm`"
+                    },
+                    {
+                      "name": "additional_itpm_needed",
+                      "expression": "`additional_itpm_needed`"
+                    },
+                    {
+                      "name": "otpm_limit",
+                      "expression": "`otpm_limit`"
+                    },
+                    {
+                      "name": "peak_otpm",
+                      "expression": "`peak_otpm`"
+                    },
+                    {
+                      "name": "recommended_otpm",
+                      "expression": "`recommended_otpm`"
+                    },
+                    {
+                      "name": "additional_otpm_needed",
+                      "expression": "`additional_otpm_needed`"
+                    },
+                    {
+                      "name": "errors_429",
+                      "expression": "`errors_429`"
+                    },
+                    {
+                      "name": "rate_429",
+                      "expression": "`rate_429`"
+                    }
+                  ],
+                  "disaggregated": true,
+                  "orders": [
+                    {
+                      "direction": "ASC",
+                      "expression": "`capacity_status`"
+                    },
+                    {
+                      "direction": "DESC",
+                      "expression": "`peak_itpm_util`"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "frame": {
+                "showTitle": true,
+                "title": "Capacity Actions (sorted by urgency)",
+                "showDescription": true,
+                "description": "Use the Additional ITPM/OTPM Needed columns when requesting a limit increase from your Databricks account team."
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "capacity_status",
+                    "displayName": "Capacity Status",
+                    "columnWidth": 180,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "1 - Request more capacity"
+                            },
+                            "operator": "="
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "2 - Watch"
+                            },
+                            "operator": "="
+                          },
+                          "backgroundColor": "#FDE68A"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "3 - Healthy"
+                            },
+                            "operator": "="
+                          },
+                          "backgroundColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "displayName": "Workspace",
+                    "columnWidth": 130
+                  },
+                  {
+                    "fieldName": "model",
+                    "displayName": "Model",
+                    "columnWidth": 170
+                  },
+                  {
+                    "fieldName": "itpm_limit",
+                    "displayName": "ITPM Limit",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "peak_itpm",
+                    "displayName": "Peak ITPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "peak_itpm_util",
+                    "displayName": "Peak ITPM Util %",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "1"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.9"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": ">="
+                          },
+                          "backgroundColor": "#FDE68A"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.7"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#4ADE80"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "recommended_itpm",
+                    "displayName": "Recommended ITPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 110
+                  },
+                  {
+                    "fieldName": "additional_itpm_needed",
+                    "displayName": "Additional ITPM Needed",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 120
+                  },
+                  {
+                    "fieldName": "otpm_limit",
+                    "displayName": "OTPM Limit",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "peak_otpm",
+                    "displayName": "Peak OTPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "recommended_otpm",
+                    "displayName": "Recommended OTPM",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 110
+                  },
+                  {
+                    "fieldName": "additional_otpm_needed",
+                    "displayName": "Additional OTPM Needed",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 120
+                  },
+                  {
+                    "fieldName": "errors_429",
+                    "displayName": "429s",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 70
+                  },
+                  {
+                    "fieldName": "rate_429",
+                    "displayName": "429 Rate",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 80,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.05"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.01"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FDE68A"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "displayRowNumbers": false,
+              "bandedRows": {
+                "enabled": true
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 17,
+            "width": 12,
+            "height": 7
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS"
+    },
+    {
+      "name": "time_series",
+      "displayName": "Capacity & Latency Over Time",
+      "layout": [
+        {
+          "widget": {
+            "name": "ts_title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Capacity & Latency Over Time\n",
+                "\n",
+                "Hourly. Peaks are the busiest minute in each hour."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 8,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_range",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "date_range",
+                      "expression": "`date_range`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Data Date Range"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "date_range"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 0,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_lookback",
+            "queries": [
+              {
+                "name": "f_lookback_options",
+                "query": {
+                  "datasetName": "lookback_options",
+                  "fields": [
+                    {
+                      "name": "days",
+                      "expression": "`days`"
+                    },
+                    {
+                      "name": "days_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_totals",
+                "query": {
+                  "datasetName": "totals",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Days Lookback"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "days",
+                    "displayName": "days",
+                    "queryName": "f_lookback_options"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_kpi"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_hourly"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_errors"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_callers"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_spend"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_totals"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_ws",
+            "queries": [
+              {
+                "name": "f_ts_ws_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_ws_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_ws_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_ws_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_ws_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_ts_ws_kpi"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_ts_ws_hourly"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_ts_ws_errors"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_ts_ws_callers"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_ts_ws_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 3,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_model",
+            "queries": [
+              {
+                "name": "f_ts_model_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_model_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_model_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_model_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_ts_model_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Model"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_ts_model_kpi"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_ts_model_hourly"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_ts_model_errors"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_ts_model_callers"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_ts_model_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 5,
+            "y": 2,
+            "width": 4,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_one",
+            "queries": [
+              {
+                "name": "f_ts_one_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    },
+                    {
+                      "name": "ws_model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Single model (for limit lines)"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "ws_model",
+                    "queryName": "f_ts_one_hourly"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_itpm_limit",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "peak_itpm",
+                      "expression": "`peak_itpm`"
+                    },
+                    {
+                      "name": "peak_uncached_itpm",
+                      "expression": "`peak_uncached_itpm`"
+                    },
+                    {
+                      "name": "itpm_limit",
+                      "expression": "`itpm_limit`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Peak ITPM vs Limit (select a single model above)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fields": [
+                    {
+                      "fieldName": "peak_itpm",
+                      "displayName": "Peak ITPM"
+                    },
+                    {
+                      "fieldName": "peak_uncached_itpm",
+                      "displayName": "Peak uncached ITPM"
+                    },
+                    {
+                      "fieldName": "itpm_limit",
+                      "displayName": "ITPM Limit"
+                    }
+                  ],
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_otpm_limit",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "peak_otpm",
+                      "expression": "`peak_otpm`"
+                    },
+                    {
+                      "name": "otpm_limit",
+                      "expression": "`otpm_limit`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Peak OTPM vs Limit (select a single model above)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fields": [
+                    {
+                      "fieldName": "peak_otpm",
+                      "displayName": "Peak OTPM"
+                    },
+                    {
+                      "fieldName": "otpm_limit",
+                      "displayName": "OTPM Limit"
+                    }
+                  ],
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 4,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_util",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "itpm_util",
+                      "expression": "`itpm_util`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Peak ITPM Utilization %"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "itpm_util",
+                  "displayName": "ITPM Util %",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 10,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_itpm",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "peak_itpm",
+                      "expression": "`peak_itpm`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Peak ITPM by Model"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "peak_itpm",
+                  "displayName": "Peak ITPM",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 16,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_rpm",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "peak_rpm",
+                      "expression": "`peak_rpm`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Peak RPM by Model"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "peak_rpm",
+                  "displayName": "Peak RPM",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 16,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_p95",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "latency_p95_s",
+                      "expression": "`latency_p95_s`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Latency p95 (s)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "latency_p95_s",
+                  "displayName": "p95 (s)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 22,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_p99",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "latency_p99_s",
+                      "expression": "`latency_p99_s`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Latency p99 (s)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "latency_p99_s",
+                  "displayName": "p99 (s)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 22,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_ttft95",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "ttfb_p95_s",
+                      "expression": "`ttfb_p95_s`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Time to First Token p95 (s)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "ttfb_p95_s",
+                  "displayName": "TTFT p95 (s)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 28,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ts_ttft99",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "ttfb_p99_s",
+                      "expression": "`ttfb_p99_s`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Time to First Token p99 (s)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "ttfb_p99_s",
+                  "displayName": "TTFT p99 (s)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 28,
+            "width": 6,
+            "height": 6
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS"
+    },
+    {
+      "name": "errors",
+      "displayName": "Errors",
+      "layout": [
+        {
+          "widget": {
+            "name": "err_title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Errors\n",
+                "\n",
+                "Status codes per workspace and model. 429 = rate limited (FMAPI capacity or your AI Gateway rate limits)."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 8,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "err_range",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "date_range",
+                      "expression": "`date_range`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Data Date Range"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "date_range"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 0,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "err_lookback",
+            "queries": [
+              {
+                "name": "f_lookback_options",
+                "query": {
+                  "datasetName": "lookback_options",
+                  "fields": [
+                    {
+                      "name": "days",
+                      "expression": "`days`"
+                    },
+                    {
+                      "name": "days_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_totals",
+                "query": {
+                  "datasetName": "totals",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Days Lookback"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "days",
+                    "displayName": "days",
+                    "queryName": "f_lookback_options"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_kpi"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_hourly"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_errors"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_callers"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_spend"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_totals"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "err_ws",
+            "queries": [
+              {
+                "name": "f_err_ws_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_ws_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_ws_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_ws_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_ws_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_err_ws_kpi"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_err_ws_hourly"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_err_ws_errors"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_err_ws_callers"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_err_ws_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 3,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "err_model",
+            "queries": [
+              {
+                "name": "f_err_model_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_model_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_model_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_model_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_err_model_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Model"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_err_model_kpi"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_err_model_hourly"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_err_model_errors"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_err_model_callers"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_err_model_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 5,
+            "y": 2,
+            "width": 4,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "err_by_class",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "sum(requests)",
+                      "expression": "SUM(`requests`)"
+                    },
+                    {
+                      "name": "status_class",
+                      "expression": "`status_class`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "frame": {
+                "showTitle": true,
+                "title": "Requests by Status Class (Hourly)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(requests)",
+                  "displayName": "Requests",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 1
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "status_class",
+                  "displayName": "status_class",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              },
+              "mark": {
+                "layout": "stack"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "err_429",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "errors_429",
+                      "expression": "`errors_429`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "frame": {
+                "showTitle": true,
+                "title": "429 Errors by Model (Hourly)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "errors_429",
+                  "displayName": "429s",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              },
+              "mark": {
+                "layout": "stack"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "err_5xx",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "errors_5xx",
+                      "expression": "`errors_5xx`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "frame": {
+                "showTitle": true,
+                "title": "5xx Errors by Model (Hourly)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "errors_5xx",
+                  "displayName": "5xx",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 0
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              },
+              "mark": {
+                "layout": "stack"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "err_rate",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "event_hour",
+                      "expression": "`event_hour`"
+                    },
+                    {
+                      "name": "error_rate",
+                      "expression": "`error_rate`"
+                    },
+                    {
+                      "name": "ws_model",
+                      "expression": "`ws_model`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "frame": {
+                "showTitle": true,
+                "title": "Error Rate % by Model (Hourly)"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "event_hour",
+                  "displayName": "Hour",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "error_rate",
+                  "displayName": "Error rate",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "exact",
+                      "places": 2
+                    }
+                  }
+                },
+                "color": {
+                  "fieldName": "ws_model",
+                  "displayName": "Workspace / Model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 15,
+            "width": 12,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "err_codes",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "status_class",
+                      "expression": "`status_class`"
+                    },
+                    {
+                      "name": "status_code",
+                      "expression": "`status_code`"
+                    },
+                    {
+                      "name": "sum(requests)",
+                      "expression": "SUM(`requests`)"
+                    }
+                  ],
+                  "disaggregated": false,
+                  "orders": [
+                    {
+                      "direction": "DESC",
+                      "expression": "SUM(`requests`)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "frame": {
+                "showTitle": true,
+                "title": "Requests by Status Code"
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace",
+                    "displayName": "Workspace",
+                    "columnWidth": 140
+                  },
+                  {
+                    "fieldName": "model",
+                    "displayName": "Model",
+                    "columnWidth": 180
+                  },
+                  {
+                    "fieldName": "status_class",
+                    "displayName": "Status Class",
+                    "columnWidth": 160
+                  },
+                  {
+                    "fieldName": "status_code",
+                    "displayName": "Status Code",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "sum(requests)",
+                    "displayName": "Requests",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 100
+                  }
+                ]
+              },
+              "bandedRows": {
+                "enabled": true
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 20,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "callers_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "requester",
+                      "expression": "`requester`"
+                    },
+                    {
+                      "name": "requester_type",
+                      "expression": "`requester_type`"
+                    },
+                    {
+                      "name": "requests",
+                      "expression": "`requests`"
+                    },
+                    {
+                      "name": "errors_429",
+                      "expression": "`errors_429`"
+                    },
+                    {
+                      "name": "rate_429",
+                      "expression": "`rate_429`"
+                    },
+                    {
+                      "name": "errors_5xx",
+                      "expression": "`errors_5xx`"
+                    },
+                    {
+                      "name": "total_tokens",
+                      "expression": "`total_tokens`"
+                    },
+                    {
+                      "name": "latency_p95_s",
+                      "expression": "`latency_p95_s`"
+                    }
+                  ],
+                  "disaggregated": true,
+                  "orders": [
+                    {
+                      "direction": "DESC",
+                      "expression": "`requests`"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "frame": {
+                "showTitle": true,
+                "title": "Usage & Errors by Caller"
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace",
+                    "displayName": "Workspace",
+                    "columnWidth": 130
+                  },
+                  {
+                    "fieldName": "model",
+                    "displayName": "Model",
+                    "columnWidth": 170
+                  },
+                  {
+                    "fieldName": "requester",
+                    "displayName": "Caller",
+                    "columnWidth": 260,
+                    "useForSearch": true
+                  },
+                  {
+                    "fieldName": "requester_type",
+                    "displayName": "Caller Type",
+                    "columnWidth": 120
+                  },
+                  {
+                    "fieldName": "requests",
+                    "displayName": "Requests",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "errors_429",
+                    "displayName": "429s",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 70
+                  },
+                  {
+                    "fieldName": "rate_429",
+                    "displayName": "429 Rate",
+                    "format": {
+                      "type": "number-percent",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 80,
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.05"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#EF4444",
+                          "foregroundColor": "#FFFFFF"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.01"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FB923C"
+                        },
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0"
+                            },
+                            "operator": ">"
+                          },
+                          "backgroundColor": "#FDE68A"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "errors_5xx",
+                    "displayName": "5xx",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    },
+                    "columnWidth": 60
+                  },
+                  {
+                    "fieldName": "total_tokens",
+                    "displayName": "Tokens",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 90
+                  },
+                  {
+                    "fieldName": "latency_p95_s",
+                    "displayName": "Latency p95 (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      }
+                    },
+                    "columnWidth": 90
+                  }
+                ]
+              },
+              "displayRowNumbers": false,
+              "bandedRows": {
+                "enabled": true
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 20,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS"
+    },
+    {
+      "name": "spend",
+      "displayName": "Spend",
+      "layout": [
+        {
+          "widget": {
+            "name": "sp_title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Spend\n",
+                "\n",
+                "List-price cost of Foundation Model API usage from system.billing.usage."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 8,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sp_range",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "totals",
+                  "fields": [
+                    {
+                      "name": "date_range",
+                      "expression": "`date_range`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "frame": {
+                "showTitle": true,
+                "title": "Data Date Range"
+              },
+              "encodings": {
+                "value": {
+                  "fieldName": "date_range"
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 0,
+            "width": 4,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sp_lookback",
+            "queries": [
+              {
+                "name": "f_lookback_options",
+                "query": {
+                  "datasetName": "lookback_options",
+                  "fields": [
+                    {
+                      "name": "days",
+                      "expression": "`days`"
+                    },
+                    {
+                      "name": "days_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "p_lookback_totals",
+                "query": {
+                  "datasetName": "totals",
+                  "parameters": [
+                    {
+                      "name": "lookback",
+                      "keyword": "lookback"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Days Lookback"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "days",
+                    "displayName": "days",
+                    "queryName": "f_lookback_options"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_kpi"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_hourly"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_errors"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_callers"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_spend"
+                  },
+                  {
+                    "parameterName": "lookback",
+                    "queryName": "p_lookback_totals"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sp_ws",
+            "queries": [
+              {
+                "name": "f_sp_ws_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_ws_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_ws_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_ws_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_ws_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "workspace_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_sp_ws_kpi"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_sp_ws_hourly"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_sp_ws_errors"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_sp_ws_callers"
+                  },
+                  {
+                    "fieldName": "workspace",
+                    "queryName": "f_sp_ws_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 3,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sp_model",
+            "queries": [
+              {
+                "name": "f_sp_model_kpi",
+                "query": {
+                  "datasetName": "kpi",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_model_hourly",
+                "query": {
+                  "datasetName": "hourly",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_model_errors",
+                "query": {
+                  "datasetName": "errors",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_model_callers",
+                "query": {
+                  "datasetName": "callers",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              },
+              {
+                "name": "f_sp_model_spend",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "model_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "frame": {
+                "showTitle": true,
+                "title": "Model"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_sp_model_kpi"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_sp_model_hourly"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_sp_model_errors"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_sp_model_callers"
+                  },
+                  {
+                    "fieldName": "model",
+                    "queryName": "f_sp_model_spend"
+                  }
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 5,
+            "y": 2,
+            "width": 4,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sp_daily",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "sum(list_cost_usd)",
+                      "expression": "SUM(`list_cost_usd`)"
+                    },
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "frame": {
+                "showTitle": true,
+                "title": "Daily List Cost by Model"
+              },
+              "encodings": {
+                "x": {
+                  "fieldName": "usage_date",
+                  "displayName": "Date",
+                  "scale": {
+                    "type": "temporal"
+                  }
+                },
+                "y": {
+                  "fieldName": "sum(list_cost_usd)",
+                  "displayName": "List cost (USD)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "format": {
+                    "type": "number-currency",
+                    "currencyCode": "USD",
+                    "abbreviation": "compact"
+                  }
+                },
+                "color": {
+                  "fieldName": "model",
+                  "displayName": "model",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
+              },
+              "data": {
+                "queryName": "main_query"
+              },
+              "mark": {
+                "layout": "stack"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 12,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "spend_table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "spend",
+                  "fields": [
+                    {
+                      "name": "workspace",
+                      "expression": "`workspace`"
+                    },
+                    {
+                      "name": "model",
+                      "expression": "`model`"
+                    },
+                    {
+                      "name": "sum(list_cost_usd)",
+                      "expression": "SUM(`list_cost_usd`)"
+                    },
+                    {
+                      "name": "sum(dbus)",
+                      "expression": "SUM(`dbus`)"
+                    }
+                  ],
+                  "disaggregated": false,
+                  "orders": [
+                    {
+                      "direction": "DESC",
+                      "expression": "SUM(`list_cost_usd`)"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "frame": {
+                "showTitle": true,
+                "title": "Spend by Workspace / Model"
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "workspace",
+                    "displayName": "Workspace",
+                    "columnWidth": 150
+                  },
+                  {
+                    "fieldName": "model",
+                    "displayName": "Model",
+                    "columnWidth": 200
+                  },
+                  {
+                    "fieldName": "sum(list_cost_usd)",
+                    "displayName": "List Cost (USD)",
+                    "format": {
+                      "type": "number-currency",
+                      "currencyCode": "USD",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 120
+                  },
+                  {
+                    "fieldName": "sum(dbus)",
+                    "displayName": "DBUs",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "compact",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    },
+                    "columnWidth": 100
+                  }
+                ]
+              },
+              "bandedRows": {
+                "enabled": true
+              },
+              "data": {
+                "queryName": "main_query"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 10,
+            "width": 12,
+            "height": 8
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS"
+    },
+    {
+      "name": "readme",
+      "displayName": "README",
+      "layout": [
+        {
+          "widget": {
+            "name": "readme",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## About this dashboard\n",
+                "\n",
+                "Built entirely on your account's system tables, so it reflects only your own traffic. `system.ai_gateway.usage` records request metadata (tokens, status, latency) but never prompts or responses, so it works in Zero Data Retention workspaces.\n",
+                "\n",
+                "### Data model (`main.fmapi_observability`, refreshed hourly)\n",
+                "- `requests`: one row per model request (from `system.ai_gateway.usage`)\n",
+                "- `minute_metrics`: tokens and requests per minute, per workspace and model\n",
+                "- `hourly_metrics`: hourly peaks, error counts, latency and TTFT percentiles\n",
+                "- `daily_model_spend`: daily DBUs and list cost per model (from `system.billing.usage`)\n",
+                "- `capacity_limits`: **maintained by you**. Add a row with the ITPM/OTPM allocation for each workspace and model, and a new row whenever a limit changes.\n",
+                "\n",
+                "### Metric definitions\n",
+                "- **ITPM**: input tokens per minute, including cached input (what FMAPI input limits count). **Uncached ITPM** excludes cache reads and writes.\n",
+                "- **Peak**: busiest single minute in the window. **P99 ITPM**: 99th percentile of active minutes, less sensitive to one-off spikes.\n",
+                "- **Util %**: peak (or P99) tokens per minute divided by the limit in `capacity_limits`.\n",
+                "- **Latency**: end-to-end request time. **TTFT**: time to first token (first byte for streaming).\n",
+                "- **Capacity Status**: *Request more capacity* = peak util >=90% or 429 rate >=1%; *Watch* = peak util >=70% or any 429s; *No limit on file* = add the allocation to `capacity_limits`.\n",
+                "- **Recommended ITPM/OTPM**: observed peak x 1.3 (30% headroom), rounded up. **Additional needed** = recommended minus current limit.\n",
+                "\n",
+                "### Notes\n",
+                "- 429s can come from FMAPI capacity limits or from AI Gateway rate limits you have set on an endpoint.\n",
+                "- Tokens are attributed to the minute the request was logged, so very long streaming requests count toward the minute they finish.\n",
+                "- Spend uses list prices; your contracted rates may differ.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 14
+          }
+        }
+      ],
+      "pageType": "PAGE_TYPE_CANVAS"
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    }
+  }
+}
