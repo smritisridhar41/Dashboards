@@ -1,6 +1,6 @@
 # FMAPI Capacity, Latency & Errors Dashboard
 
-An AI/BI (Lakeview) dashboard for Foundation Model API (FMAPI) and AI Gateway traffic. For each workspace and model it shows:
+An AI/BI dashboard for Foundation Model API (FMAPI) and AI Gateway traffic. For each workspace and model it shows:
 
 - **Capacity:** peak and P99 input/output tokens per minute (ITPM / OTPM) against your allocated limits, plus a recommended limit and how much more to request
 - **Errors:** 429 (rate limited), 4xx and 5xx counts and rates, by model and by caller
