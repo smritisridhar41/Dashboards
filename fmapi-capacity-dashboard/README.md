@@ -17,7 +17,7 @@ It is built only on **system tables** (`system.ai_gateway.usage`, `system.billin
 | `fmapi_capacity_latency_errors.lvdash.json` | The dashboard. Import it into Databricks |
 | `build_dashboard.py` | Regenerates the dashboard JSON, e.g. to point it at a different catalog/schema |
 
-## Dashboard pages
+## Dashboard 
 
 1. **Capacity KPIs:** headline counters (requests, success rate, 429s, 5xx, p95/p99 latency), a per workspace/model KPI table, and a **Capacity Actions** table sorted by urgency
 2. **Capacity & Latency Over Time:** peak ITPM/OTPM vs limit, utilization %, peak RPM, latency and TTFT percentiles (hourly)
