@@ -1,4 +1,4 @@
-# FMAPI Capacity, Latency & Errors Dashboard
+# FMAPI Capacity, Latency & Errors dash
 
 An AI/BI dashboard for Foundation Model API (FMAPI) and AI Gateway traffic. For each workspace and model it shows:
 
